@@ -5,10 +5,16 @@ from __future__ import unicode_literals
 
 from django.http import Http404
 from django.utils import six
+from selenium.webdriver.support.expected_conditions import visibility_of
 
 from rest_framework import exceptions
+from rest_framework.utils.model_getter import _model
 
 SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
+
+
+class ModelNotFoundErr(Exception):
+    pass
 
 
 class OperationHolderMixin:
@@ -124,22 +130,8 @@ class IsAdminUser(BasePermission):
 
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_staff)
-
-
-class IsAuthenticatedOrReadOnly(BasePermission):
-    """
-    The request is authenticated as a user, or is a read-only request.
-    """
-
-    def has_permission(self, request, view):
-        return bool(
-            request.method in SAFE_METHODS or
-            request.user and
-            request.user.is_authenticated
-        )
-
-
 class DjangoModelPermissions(BasePermission):
+
     """
     The request is authenticated using `django.contrib.auth` permissions.
     See: https://docs.djangoproject.com/en/dev/topics/auth/#permissions
@@ -150,10 +142,10 @@ class DjangoModelPermissions(BasePermission):
     This permission can only be applied against view classes that
     provide a `.queryset` attribute.
     """
-
     # Map methods into required permission codes.
     # Override this if you need to also provide 'view' permissions,
     # or if you want to provide custom permission codes.
+
     perms_map = {
         'GET': [],
         'OPTIONS': [],
@@ -181,20 +173,32 @@ class DjangoModelPermissions(BasePermission):
 
         return [perm % kwargs for perm in self.perms_map[method]]
 
-    def _queryset(self, view):
-        assert hasattr(view, 'get_queryset') \
-            or getattr(view, 'queryset', None) is not None, (
-            'Cannot apply {} on a view that does not set '
-            '`.queryset` or have a `.get_queryset()` method.'
-        ).format(self.__class__.__name__)
-
-        if hasattr(view, 'get_queryset'):
-            queryset = view.get_queryset()
-            assert queryset is not None, (
-                '{}.get_queryset() returned None'.format(view.__class__.__name__)
+    def _queryset(self, view_or_queryset):
+        if hasattr(view_or_queryset, 'get_queryset'):
+            queryset = view_or_queryset.get_queryset()
+            assert queryset is not None, ModelNotFoundErr(
+                '{}.get_queryset() returned None'.format(view_or_queryset.__class__.__name__)
             )
             return queryset
-        return view.queryset
+        if hasattr(view_or_queryset, "queryset"):
+            assert view_or_queryset.queryset is not None, ModelNotFoundErr(
+                "{}.queryset is None".format(view_or_queryset.__class__.__name__)
+            )
+            return view_or_queryset.queryset
+        assert ModelNotFoundErr("{} has not a model".format(view_or_queryset.__class__.__name__))
+
+    def _model(self, view_or_queryset):
+        try:
+            return self._queryset(view_or_queryset)
+        except ModelNotFoundErr:
+            if getattr(view_or_queryset, "model", None):
+                return view_or_queryset.model
+            if hasattr(view_or_queryset, "Meta") and hasattr(view_or_queryset.Meta, "model"):
+                return view_or_queryset.Meta.model
+            raise ModelNotFoundErr(
+                "Cannot apply {} on {}, cannot find model".format(
+                    self.__class__.__name__, view_or_queryset.__class__.__name__)
+            )
 
     def has_permission(self, request, view):
         # Workaround to ensure DjangoModelPermissions are not applied
@@ -206,10 +210,23 @@ class DjangoModelPermissions(BasePermission):
            not request.user.is_authenticated and self.authenticated_users_only):
             return False
 
-        queryset = self._queryset(view)
-        perms = self.get_required_permissions(request.method, queryset.model)
+        model = _model(view)
+        perms = self.get_required_permissions(request.method, model)
 
         return request.user.has_perms(perms)
+
+
+class IsAuthenticatedOrReadOnly(BasePermission):
+    """
+    The request is authenticated as a user, or is a read-only request.
+    """
+
+    def has_permission(self, request, view):
+        return bool(
+            request.method in SAFE_METHODS or
+            request.user and
+            request.user.is_authenticated
+        )
 
 
 class DjangoModelPermissionsOrAnonReadOnly(DjangoModelPermissions):
@@ -254,8 +271,7 @@ class DjangoObjectPermissions(DjangoModelPermissions):
 
     def has_object_permission(self, request, view, obj):
         # authentication checks have already executed via has_permission
-        queryset = self._queryset(view)
-        model_cls = queryset.model
+        model_cls = _model(view)
         user = request.user
 
         perms = self.get_required_object_permissions(request.method, model_cls)
